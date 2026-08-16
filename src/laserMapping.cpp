@@ -4,6 +4,8 @@
 #include <thread>
 #include <fstream>
 #include <csignal>
+#include <chrono>
+#include <sstream>
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
@@ -13,6 +15,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -51,6 +54,19 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, propag_time = 0, update_time = 0;
 
 bool lidar_pushed = false, flg_reset = false, flg_exit = false;
+bool point_lio_odometry_valid = false;
+bool point_lio_valid_status_published = false;
+bool last_point_lio_valid_status = false;
+bool lidar_receive_seen = false;
+bool imu_receive_seen = false;
+bool recovery_reinit_required = false;
+bool recovery_lidar_seen_since_timeout = false;
+bool recovery_imu_seen_since_timeout = false;
+
+using SteadyClock = std::chrono::steady_clock;
+SteadyClock::time_point last_lidar_receive_time;
+SteadyClock::time_point last_imu_receive_time;
+SteadyClock::time_point last_high_rate_odom_publish_time;
 
 vector<BoxPointType> cub_needrm;
 
@@ -62,6 +78,9 @@ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_deque;
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body_space(new PointCloudXYZI());
 PointCloudXYZI::Ptr init_feats_world(new PointCloudXYZI());
+int points_cache_size = 0;
+BoxPointType LocalMap_Points;
+bool Localmap_Initialized = false;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
@@ -75,6 +94,7 @@ sensor_msgs::msg::Imu::ConstSharedPtr imu_last_ptr;
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::PoseStamped msg_body_pose;
+rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pubPointLioValid;
 
 auto logger = rclcpp::get_logger("laserMapping");
 
@@ -116,6 +136,201 @@ inline void dump_lio_state_to_log(FILE *fp) {
     fflush(fp);
 }
 
+Eigen::Matrix<double, 24, 24> initial_input_covariance() {
+    Eigen::Matrix<double, 24, 24> P_init = MD(24, 24)::Identity() * 0.01;
+    P_init.block<3, 3>(21, 21) = MD(3, 3)::Identity() * 0.0001;
+    P_init.block<6, 6>(15, 15) = MD(6, 6)::Identity() * 0.001;
+    P_init.block<6, 6>(6, 6) = MD(6, 6)::Identity() * 0.0001;
+    return P_init;
+}
+
+Eigen::Matrix<double, 30, 30> initial_output_covariance() {
+    Eigen::Matrix<double, 30, 30> P_init_output = MD(30, 30)::Identity() * 0.01;
+    P_init_output.block<3, 3>(21, 21) = MD(3, 3)::Identity() * 0.0001;
+    P_init_output.block<6, 6>(6, 6) = MD(6, 6)::Identity() * 0.0001;
+    P_init_output.block<6, 6>(24, 24) = MD(6, 6)::Identity() * 0.001;
+    return P_init_output;
+}
+
+void publish_point_lio_valid_status(bool valid, bool force = false) {
+    if (!pubPointLioValid) return;
+    if (!force && point_lio_valid_status_published && valid == last_point_lio_valid_status) return;
+
+    std_msgs::msg::Bool msg;
+    msg.data = valid;
+    pubPointLioValid->publish(msg);
+    point_lio_valid_status_published = true;
+    last_point_lio_valid_status = valid;
+}
+
+void set_point_lio_odometry_valid(bool valid) {
+    if (point_lio_odometry_valid == valid) {
+        publish_point_lio_valid_status(valid);
+        return;
+    }
+
+    point_lio_odometry_valid = valid;
+    publish_point_lio_valid_status(valid, true);
+    if (valid) {
+        RCLCPP_INFO(logger, "Point-LIO initialization complete");
+        RCLCPP_INFO(logger, "Point-LIO odometry valid");
+    } else {
+        RCLCPP_WARN(logger, "Point-LIO odometry marked invalid");
+    }
+}
+
+void clear_measurement_buffers_locked() {
+    lidar_buffer.clear();
+    time_buffer.clear();
+    imu_deque.clear();
+    lidar_pushed = false;
+    Measures = MeasureGroup();
+}
+
+void apply_configured_extrinsics_to_filter_state() {
+    if (!extrinsic_est_en) return;
+
+    if (!use_imu_as_input) {
+        state_out.offset_R_L_I = Lidar_R_wrt_IMU;
+        state_out.offset_T_L_I = Lidar_T_wrt_IMU;
+    } else {
+        state_in.offset_R_L_I = Lidar_R_wrt_IMU;
+        state_in.offset_T_L_I = Lidar_T_wrt_IMU;
+    }
+}
+
+void reset_high_rate_odometry_gate() {
+    last_high_rate_odom_publish_time = SteadyClock::time_point{};
+}
+
+void reset_point_lio_estimator_state() {
+    RCLCPP_WARN(logger, "Resetting Point-LIO estimator");
+    RCLCPP_INFO(logger, "Reinitializing IMU");
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+        clear_measurement_buffers_locked();
+        last_timestamp_lidar = -1.0;
+        last_timestamp_imu = -1.0;
+    }
+
+    p_imu->Reset();
+
+    init_map = false;
+    flg_first_scan = true;
+    is_first_frame = true;
+    flg_reset = false;
+    frame_ct = 0;
+    feats_down_size = 0;
+    time_update_last = 0.0;
+    time_current = 0.0;
+    time_predict_last_const = 0.0;
+    t_last = 0.0;
+    lidar_end_time = 0.0;
+    first_lidar_time = 0.0;
+    time_con = 0.0;
+    points_cache_size = 0;
+    effct_feat_num = 0;
+    k = 0;
+    idx = 0;
+
+    cub_needrm.clear();
+    ptr_con->clear();
+    feats_undistort->clear();
+    feats_down_body->clear();
+    feats_down_body_space->clear();
+    feats_down_world->clear();
+    init_feats_world->clear();
+    normvec->clear();
+    time_seq.clear();
+    pbody_list.clear();
+    Nearest_Points.clear();
+    crossmat_list.clear();
+    ikdtree.Clear();
+    Localmap_Initialized = false;
+
+    path = nav_msgs::msg::Path();
+    path.header.stamp = get_ros_time(lidar_end_time);
+    path.header.frame_id = odom_header_frame_id;
+    odomAftMapped = nav_msgs::msg::Odometry();
+    msg_body_pose = geometry_msgs::msg::PoseStamped();
+    imu_last = sensor_msgs::msg::Imu();
+    imu_next = sensor_msgs::msg::Imu();
+    imu_last_ptr.reset();
+
+    state_in = state_input();
+    state_out = state_output();
+    input_in = input_ikfom();
+    angvel_avr = Zero3d;
+    acc_avr = Zero3d;
+    apply_configured_extrinsics_to_filter_state();
+
+    auto P_init = initial_input_covariance();
+    auto P_init_output = initial_output_covariance();
+    kf_input.change_x(state_in);
+    kf_output.change_x(state_out);
+    kf_input.change_P(P_init);
+    kf_output.change_P(P_init_output);
+    reset_high_rate_odometry_gate();
+}
+
+bool required_sensor_receive_seen() {
+    return lidar_receive_seen && (!imu_en || imu_receive_seen);
+}
+
+bool recovery_inputs_resumed_locked() {
+    return recovery_lidar_seen_since_timeout && (!imu_en || recovery_imu_seen_since_timeout);
+}
+
+bool sensor_timeout_exceeded(std::string &detail) {
+    if (!recovery_enable_auto_reinitialize || recovery_sensor_timeout_sec <= 0.0 || recovery_reinit_required) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    if (!required_sensor_receive_seen()) return false;
+
+    const auto now = SteadyClock::now();
+    const double lidar_age = std::chrono::duration<double>(now - last_lidar_receive_time).count();
+    const double imu_age = imu_en ? std::chrono::duration<double>(now - last_imu_receive_time).count() : 0.0;
+    const bool lidar_timeout = lidar_age > recovery_sensor_timeout_sec;
+    const bool imu_timeout = imu_en && imu_age > recovery_sensor_timeout_sec;
+
+    if (!lidar_timeout && !imu_timeout) return false;
+
+    std::ostringstream oss;
+    oss << "lidar_age=" << lidar_age << "s";
+    if (imu_en) oss << ", imu_age=" << imu_age << "s";
+    detail = oss.str();
+    return true;
+}
+
+void mark_sensor_timeout_for_recovery(const std::string &detail) {
+    {
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+        recovery_reinit_required = true;
+        recovery_lidar_seen_since_timeout = false;
+        recovery_imu_seen_since_timeout = false;
+        clear_measurement_buffers_locked();
+    }
+
+    RCLCPP_WARN(logger, "Point-LIO sensor timeout detected (%s, timeout=%.3fs)",
+                detail.c_str(), recovery_sensor_timeout_sec);
+    set_point_lio_odometry_valid(false);
+}
+
+bool consume_recovery_resume_request() {
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    if (!recovery_reinit_required || !recovery_inputs_resumed_locked()) {
+        return false;
+    }
+
+    recovery_reinit_required = false;
+    recovery_lidar_seen_since_timeout = false;
+    recovery_imu_seen_since_timeout = false;
+    return true;
+}
+
 void pointBodyLidarToIMU(PointType const *const pi, PointType *const po) {
     V3D p_body_lidar(pi->x, pi->y, pi->z);
     V3D p_body_imu;
@@ -134,17 +349,12 @@ void pointBodyLidarToIMU(PointType const *const pi, PointType *const po) {
     po->intensity = pi->intensity;
 }
 
-int points_cache_size = 0;
-
 void points_cache_collect() // seems for debug
 {
     PointVector points_history;
     ikdtree.acquire_removed_points(points_history);
     points_cache_size = points_history.size();
 }
-
-BoxPointType LocalMap_Points;
-bool Localmap_Initialized = false;
 
 void lasermap_fov_segment() {
     cub_needrm.shrink_to_fit();
@@ -198,7 +408,11 @@ void lasermap_fov_segment() {
 }
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    const auto receive_time = SteadyClock::now();
     mtx_buffer.lock();
+    last_lidar_receive_time = receive_time;
+    lidar_receive_seen = true;
+    if (recovery_reinit_required) recovery_lidar_seen_since_timeout = true;
     scan_count++;
     double preprocess_start_time = omp_get_wtime();
     if (get_time_sec(msg->header.stamp) < last_timestamp_lidar) {
@@ -210,7 +424,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         return;
     }
 
-    last_timestamp_lidar = msg->header.stamp.sec;
+    last_timestamp_lidar = get_time_sec(msg->header.stamp);
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     PointCloudXYZI::Ptr ptr_div(new PointCloudXYZI());
@@ -336,6 +550,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
 // }
 
 void imu_cbk(const sensor_msgs::msg::Imu::SharedPtr msg_in) {
+    const auto receive_time = SteadyClock::now();
     publish_count++;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
 
@@ -343,6 +558,9 @@ void imu_cbk(const sensor_msgs::msg::Imu::SharedPtr msg_in) {
     double timestamp = get_time_sec(msg->header.stamp);
 
     mtx_buffer.lock();
+    last_imu_receive_time = receive_time;
+    imu_receive_seen = true;
+    if (recovery_reinit_required) recovery_imu_seen_since_timeout = true;
 
     if (timestamp < last_timestamp_imu) {
         RCLCPP_ERROR(logger, "imu loop back, clear deque");
@@ -637,6 +855,7 @@ void set_twist(T &out) {
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pubOdomAftMapped,
                       std::shared_ptr<tf2_ros::TransformBroadcaster> &tf_br) {
+    if (!point_lio_odometry_valid) return;
 
     odomAftMapped.header.frame_id = odom_header_frame_id;
     odomAftMapped.child_frame_id = odom_child_frame_id;
@@ -690,6 +909,33 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     transform.header.stamp = odomAftMapped.header.stamp;
 
     tf_br->sendTransform(transform);
+}
+
+bool high_rate_odometry_publish_due() {
+    // Non-positive rate preserves the original unlimited high-rate publication behavior.
+    if (odometry_publish_rate_hz <= 0.0 || !std::isfinite(odometry_publish_rate_hz)) {
+        return true;
+    }
+
+    const auto now = SteadyClock::now();
+    const double elapsed_seconds = std::chrono::duration<double>(now - last_high_rate_odom_publish_time).count();
+    const double min_interval_seconds = 1.0 / odometry_publish_rate_hz;
+
+    if (last_high_rate_odom_publish_time == SteadyClock::time_point{} ||
+        elapsed_seconds >= min_interval_seconds) {
+        last_high_rate_odom_publish_time = now;
+        return true;
+    }
+
+    return false;
+}
+
+void publish_high_rate_odometry_if_due(
+        const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pubOdomAftMapped,
+        std::shared_ptr<tf2_ros::TransformBroadcaster> &tf_br) {
+    if (high_rate_odometry_publish_due()) {
+        publish_odometry(pubOdomAftMapped, tf_br);
+    }
 }
 
 void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath) {
@@ -746,16 +992,9 @@ int main(int argc, char **argv) {
 
     kf_input.init_dyn_share_modified(get_f_input, df_dx_input, h_model_input);
     kf_output.init_dyn_share_modified_2h(get_f_output, df_dx_output, h_model_output, h_model_IMU_output);
-    Eigen::Matrix<double, 24, 24> P_init = MD(24, 24)::Identity() * 0.01;
-    P_init.block<3, 3>(21, 21) = MD(3, 3)::Identity() * 0.0001;
-    P_init.block<6, 6>(15, 15) = MD(6, 6)::Identity() * 0.001;
-    P_init.block<6, 6>(6, 6) = MD(6, 6)::Identity() * 0.0001;
+    Eigen::Matrix<double, 24, 24> P_init = initial_input_covariance();
     kf_input.change_P(P_init);
-    Eigen::Matrix<double, 30, 30> P_init_output = MD(30, 30)::Identity() * 0.01;
-    P_init_output.block<3, 3>(21, 21) = MD(3, 3)::Identity() * 0.0001;
-    P_init_output.block<6, 6>(6, 6) = MD(6, 6)::Identity() * 0.0001;
-    P_init_output.block<6, 6>(24, 24) = MD(6, 6)::Identity() * 0.001;
-    kf_input.change_P(P_init);
+    Eigen::Matrix<double, 30, 30> P_init_output = initial_output_covariance();
     kf_output.change_P(P_init_output);
     Eigen::Matrix<double, 24, 24> Q_input = process_noise_cov_input();
     Eigen::Matrix<double, 30, 30> Q_output = process_noise_cov_output();
@@ -810,6 +1049,9 @@ int main(int argc, char **argv) {
         pubOdomAftMapped = nh->create_publisher<nav_msgs::msg::Odometry>
                 ("/aft_mapped_to_init", 100000);
     }
+    pubPointLioValid = nh->create_publisher<std_msgs::msg::Bool>
+            ("/point_lio/valid", rclcpp::QoS(1).reliable().transient_local());
+    publish_point_lio_valid_status(false, true);
 
     //auto plane_pub = nh->create_publisher<visualization_msgs::msg::Marker>
     //        ("/planner_normal", 1000);
@@ -823,6 +1065,20 @@ int main(int argc, char **argv) {
         rclcpp::executors::SingleThreadedExecutor executor;
         executor.add_node(nh);
         executor.spin_some(); // 处理当前可用的回调
+
+        std::string timeout_detail;
+        if (sensor_timeout_exceeded(timeout_detail)) {
+            mark_sensor_timeout_for_recovery(timeout_detail);
+            rate.sleep();
+            continue;
+        }
+
+        if (consume_recovery_resume_request()) {
+            RCLCPP_INFO(logger, "Sensor data resumed");
+            reset_point_lio_estimator_state();
+            rate.sleep();
+            continue;
+        }
 
         if (sync_packages(Measures)) {
             if (flg_first_scan) {
@@ -1070,7 +1326,8 @@ int main(int argc, char **argv) {
                     if (publish_odometry_without_downsample) {
                         /******* Publish odometry *******/
 
-                        publish_odometry(pubOdomAftMapped, tf_broadcaster);
+                        set_point_lio_odometry_valid(true);
+                        publish_high_rate_odometry_if_due(pubOdomAftMapped, tf_broadcaster);
                         if (runtime_pos_log) {
                             state_out = kf_output.x_;
                             euler_cur = SO3ToEuler(state_out.rot);
@@ -1223,7 +1480,8 @@ int main(int argc, char **argv) {
                     if (publish_odometry_without_downsample) {
                         /******* Publish odometry *******/
 
-                        publish_odometry(pubOdomAftMapped, tf_broadcaster);
+                        set_point_lio_odometry_valid(true);
+                        publish_high_rate_odometry_if_due(pubOdomAftMapped, tf_broadcaster);
                         if (runtime_pos_log) {
                             state_in = kf_input.x_;
                             euler_cur = SO3ToEuler(state_in.rot);
@@ -1249,6 +1507,7 @@ int main(int argc, char **argv) {
 
             /******* Publish odometry downsample *******/
             if (!publish_odometry_without_downsample) {
+                set_point_lio_odometry_valid(true);
                 publish_odometry(pubOdomAftMapped, tf_broadcaster);
             }
 

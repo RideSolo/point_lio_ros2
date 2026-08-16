@@ -48,7 +48,12 @@
                           0.0, 0.0, 1.0 ] # ulhk 4 utbm 3
 
         odometry: 
-            publish_odometry_without_downsample: true  
+            publish_odometry_without_downsample: true
+            publish_rate_hz: 400.0
+
+        recovery:
+            enable_auto_reinitialize: true
+            sensor_timeout_sec: 0.5
 
         publish:
             path_en: true                 # false: close the path output
@@ -56,6 +61,6 @@
             scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
 
         pcd_save:
-            pcd_save_en: true       # save map to pcd file
+            pcd_save_en: false      # save map to pcd file
             interval: -1            # how many LiDAR frames saved in each pcd file; 
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

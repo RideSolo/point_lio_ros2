@@ -76,6 +76,8 @@ void ImuProcess::Reset() {
     mean_acc = V3D(0, 0, -1.0);
     mean_gyr = V3D(0, 0, 0);
     imu_need_init_ = true;
+    b_first_frame_ = true;
+    gravity_align_ = false;
     init_iter_num = 1;
 }
 

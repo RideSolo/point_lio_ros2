@@ -9,7 +9,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     # Declare the RViz argument
     rviz_arg = DeclareLaunchArgument(
-        'rviz', default_value='true',
+        'rviz', default_value='false',
         description='Flag to launch RViz.')
 
     # Node parameters, including those from the YAML configuration file
@@ -38,6 +38,8 @@ def generate_launch_description():
         executable='pointlio_mapping',
         name='laserMapping',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
         parameters=laser_mapping_params,
         # prefix='gdb -ex run --args'
     )

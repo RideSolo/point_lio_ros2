@@ -11,6 +11,9 @@ int pcd_index = 0;
 std::string lid_topic, imu_topic;
 bool prop_at_freq_of_imu, check_satu, con_frame, cut_frame;
 bool use_imu_as_input, space_down_sample, publish_odometry_without_downsample;
+double odometry_publish_rate_hz = 0.0;
+bool recovery_enable_auto_reinitialize = false;
+double recovery_sensor_timeout_sec = 0.5;
 int init_map_size, con_frame_num;
 double match_s, satu_acc, satu_gyro, cut_frame_time_interval;
 float plane_thr;
@@ -87,6 +90,9 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
     nh->declare_parameter<std::vector<double>>("mapping.extrinsic_T", {0, 0, 0});
     nh->declare_parameter<std::vector<double>>("mapping.extrinsic_R", {1, 0, 0, 0, 1, 0, 0, 0, 1});
     nh->declare_parameter<bool>("odometry.publish_odometry_without_downsample", false);
+    nh->declare_parameter<double>("odometry.publish_rate_hz", 0.0);
+    nh->declare_parameter<bool>("recovery.enable_auto_reinitialize", false);
+    nh->declare_parameter<double>("recovery.sensor_timeout_sec", 0.5);
     nh->declare_parameter<bool>("publish.path_en", true);
     nh->declare_parameter<bool>("publish.scan_publish_en", true);
     nh->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
@@ -147,6 +153,9 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
     nh->get_parameter("mapping.extrinsic_T", extrinT);
     nh->get_parameter("mapping.extrinsic_R", extrinR);
     nh->get_parameter("odometry.publish_odometry_without_downsample", publish_odometry_without_downsample);
+    nh->get_parameter("odometry.publish_rate_hz", odometry_publish_rate_hz);
+    nh->get_parameter("recovery.enable_auto_reinitialize", recovery_enable_auto_reinitialize);
+    nh->get_parameter("recovery.sensor_timeout_sec", recovery_sensor_timeout_sec);
     nh->get_parameter("publish.path_en", path_en);
     nh->get_parameter("publish.scan_publish_en", scan_pub_en);
     nh->get_parameter("publish.scan_bodyframe_pub_en", scan_body_pub_en);
@@ -154,4 +163,3 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
     nh->get_parameter("pcd_save.pcd_save_en", pcd_save_en);
     nh->get_parameter("pcd_save.interval", pcd_save_interval);
 }
-
